@@ -1,0 +1,233 @@
+def reportingAccounts = [:]
+def reportingNotification = [:]
+
+pipeline {
+    agent {
+        kubernetes {
+            inheritFrom 'terraform-python-multi'
+            defaultContainer 'python'
+        }
+    }
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    triggers {
+        cron('TZ=Europe/London\n30 8 5 * *')
+    }
+
+    environment {
+        REPORT_CONFIG_PARAMETER = '/build/jenkins/aws-cost-reporting/config'
+    }
+    parameters {
+        string(name: 'REPORT_MONTH', defaultValue: '',
+               description: 'Completed month YYYY-MM; blank means the last completed month.')
+        string(name: 'ACCOUNTS', defaultValue: '',
+               description: 'Optional account IDs separated by commas or spaces. Blank selects all accounts in Parameter Store. Scheduled runs always select all configured accounts.')
+        string(name: 'EMAIL_TO', defaultValue: '',
+               description: 'Optional recipient email addresses separated by commas. Blank uses the recipients in Parameter Store.')
+    }
+    stages {
+        stage('Load Account Configuration') {
+            steps {
+                container('python') {
+                    sh '''
+                        set -eu
+                        set +x
+                        aws ssm get-parameter \
+                            --name "$REPORT_CONFIG_PARAMETER" \
+                            --region eu-west-1 \
+                            --query Parameter.Value --output text > reporting-config.json
+                    '''
+                }
+                script {
+                    def configuration = readJSON file: 'reporting-config.json', returnPojo: true
+                    if (!(configuration instanceof Map) || !(configuration.accounts instanceof Map) || !configuration.accounts) {
+                        error('The report configuration must contain a non-empty accounts object.')
+                    }
+                    reportingAccounts = configuration.accounts
+                    if (!(configuration.notification instanceof Map)) {
+                        error('The report configuration must contain a notification object.')
+                    }
+                    reportingNotification = configuration.notification
+                    reportingAccounts.each { accountId, settings ->
+                        if (!(accountId ==~ /[0-9]{12}/) || !(settings instanceof Map)) {
+                            error('Account configuration must map 12-digit account IDs to settings objects.')
+                        }
+                        if (!(settings.name instanceof String) || !settings.name.trim() ||
+                            settings.name.length() > 128 || (settings.name =~ /[\p{Cntrl}]/).find()) {
+                            error("${accountId}: provide a valid account name.")
+                        }
+                        if (!(settings.environment in ['nonprod', 'prod'])) {
+                            error("${accountId}: environment must be nonprod or prod.")
+                        }
+                        if (!(settings.role_parameters_path instanceof String) ||
+                            !(settings.role_parameters_path ==~ /\/build\/jenkins\/crossaccount\/[A-Za-z0-9_.\/-]+\//)) {
+                            error("${accountId}: provide a role_parameters_path under /build/jenkins/crossaccount/ ending with a slash.")
+                        }
+                    }
+                    def supported = reportingAccounts.keySet().toList().sort()
+                    if (!supported.contains(reportingNotification.account_id)) {
+                        error('The notification account must be present in the configured accounts.')
+                    }
+                    def scheduled = currentBuild.getBuildCauses('hudson.triggers.TimerTrigger$TimerTriggerCause').size() > 0
+                    def requested = scheduled ? '' : (params.ACCOUNTS ?: '').trim()
+                    def selected = requested ? requested.split(/[,\s]+/).toList() : supported
+                    if (selected.any { !(it ==~ /[0-9]{12}/) }) {
+                        error('ACCOUNTS must contain 12-digit account IDs separated by commas or spaces.')
+                    }
+                    if (selected.size() != selected.unique(false).size()) {
+                        error('ACCOUNTS contains duplicate account IDs.')
+                    }
+                    def unsupported = selected.findAll { !supported.contains(it) }
+                    unsupported.each { accountId ->
+                        echo "Skipping account ${accountId}: configuration is not available in Parameter Store."
+                        }
+                    selected = selected.findAll { supported.contains(it) }
+                    if (selected.isEmpty()) {
+                        error('No valid accounts remain. Check the supplied account IDs.')
+                    }
+                    env.SELECTED_ACCOUNTS = selected.join(' ')
+                    env.COST_REPORT_MONTH = scheduled ? '' : (params.REPORT_MONTH ?: '').trim()
+                    env.REPORT_EMAIL_TO = scheduled ? '' : (params.EMAIL_TO ?: '').trim()
+                    echo "Selected accounts: ${env.SELECTED_ACCOUNTS}"
+                }
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                container('python') {
+                    sh '''
+                        set -eu
+                        set +x
+                        uv venv --python 3.12 .venv-reporting
+                        token=$(aws codeartifact get-authorization-token \
+                            --domain data-theverygroup \
+                            --domain-owner 669610644781 \
+                            --query authorizationToken --output text \
+                            --region eu-west-1)
+                        export PIP_INDEX_URL="https://aws:${token}@data-theverygroup-669610644781.d.codeartifact.eu-west-1.amazonaws.com/pypi/build-cip-service-artifacts/simple/"
+                        uv pip install --python .venv-reporting/bin/python -r requirements.txt
+                        unset token PIP_INDEX_URL
+                        .venv-reporting/bin/python -m py_compile src/aws_cost_report.py src/fetch_account_costs.py src/combine_cost_reports.py src/send_report_email.py
+                        .venv-reporting/bin/python -m src.fetch_account_costs --help
+                        .venv-reporting/bin/python -c "import shutil; shutil.rmtree('report-data', ignore_errors=True); shutil.rmtree('report-output-combined', ignore_errors=True)"
+                    '''
+                }
+            }
+        }
+        stage('Fetch Account Costs') {
+            steps {
+                script {
+                    def selected = env.SELECTED_ACCOUNTS.tokenize(' ')
+                    selected.each { expectedAccount ->
+                        def settings = reportingAccounts[expectedAccount]
+                        def environmentName = settings.environment
+                        def accountName = settings.name.trim()
+                        withAWSParameterStore(credentialsId: '', naming: 'basename',
+                            path: settings.role_parameters_path,
+                            recursive: true, regionName: 'eu-west-1') {
+                            if (env.ACCOUNTID != expectedAccount) {
+                                error("SSM account at ${settings.role_parameters_path} does not match configured account ${expectedAccount}.")
+                            }
+                            if (!env.ROLEARN?.trim() || !env.EXTERNALID?.trim()) {
+                                error("Missing role configuration for ${environmentName}.")
+                            }
+                            withAWS(roleAccount: env.ACCOUNTID, externalId: env.EXTERNALID,
+                                    role: env.ROLEARN) {
+                                container('python') {
+                                    withEnv(["TARGET_ENV=${environmentName}",
+                                             "TARGET_ACCOUNT=${expectedAccount}",
+                                             "TARGET_ACCOUNT_NAME=${accountName}"]) {
+                                        echo "Fetching ${environmentName} account ${accountName} (${expectedAccount})"
+                                        sh '''
+                                            set -eu
+                                            set +x
+                                            if [ -n "${COST_REPORT_MONTH:-}" ]; then
+                                                .venv-reporting/bin/python -m src.fetch_account_costs \
+                                                    --env "$TARGET_ENV" --accountid "$TARGET_ACCOUNT" \
+                                                    --account-name "$TARGET_ACCOUNT_NAME" \
+                                                    --month "$COST_REPORT_MONTH" --output report-data
+                                            else
+                                                .venv-reporting/bin/python -m src.fetch_account_costs \
+                                                    --env "$TARGET_ENV" --accountid "$TARGET_ACCOUNT" \
+                                                    --account-name "$TARGET_ACCOUNT_NAME" \
+                                                    --output report-data
+                                            fi
+                                        '''
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Generate Combined Report') {
+            steps {
+                container('python') {
+                    sh '''
+                        set -eu
+                        # SELECTED_ACCOUNTS contains only validated 12-digit IDs.
+                        # Split it into separate --accounts arguments.
+                        set -- $SELECTED_ACCOUNTS
+                        .venv-reporting/bin/python -m src.combine_cost_reports \
+                            --input report-data \
+                            --output report-output-combined \
+                            --accounts "$@"
+                    '''
+                }
+            }
+        }
+        stage('Save Report Files') {
+            steps {
+                archiveArtifacts(
+                    artifacts: 'report-data/*.json',
+                    allowEmptyArchive: false,
+                    fingerprint: true
+                )
+                archiveArtifacts(
+                    artifacts: 'report-output-combined/monthly-cost-report.*',
+                    allowEmptyArchive: false,
+                    fingerprint: true
+                )
+            }
+        }
+        stage('Upload Report and Send Email') {
+            steps {
+                script {
+                    def notificationAccount = reportingNotification.account_id
+                    def settings = reportingAccounts[notificationAccount]
+                    withAWSParameterStore(credentialsId: '', naming: 'basename',
+                        path: settings.role_parameters_path,
+                        recursive: true, regionName: 'eu-west-1') {
+                        if (env.ACCOUNTID != notificationAccount) {
+                            error('The notification role account does not match the configured account.')
+                        }
+                        if (!env.ROLEARN?.trim() || !env.EXTERNALID?.trim()) {
+                            error('Missing notification role configuration.')
+                        }
+                        withAWS(roleAccount: env.ACCOUNTID, externalId: env.EXTERNALID,
+                                role: env.ROLEARN) {
+                            container('python') {
+                                sh '''
+                                    set -eu
+                                    set +x
+                                    set -- $SELECTED_ACCOUNTS
+                                    .venv-reporting/bin/python -m src.send_report_email \
+                                        --config reporting-config.json \
+                                        --input report-data \
+                                        --excel report-output-combined/monthly-cost-report.xlsx \
+                                        --run-id "$BUILD_NUMBER" \
+                                        --accounts "$@"
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
